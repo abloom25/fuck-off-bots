@@ -16,8 +16,31 @@ from .data_manager import bot_manager
 config = get_driver().config
 ENABLED_GROUPS: Set[int] = set()
 enabled_groups_config = getattr(config, "enabled_groups", [])
+
+if isinstance(enabled_groups_config, str):
+    try:
+        loaded = json.loads(enabled_groups_config)
+        if isinstance(loaded, list):
+            enabled_groups_config = loaded
+        else:
+            enabled_groups_config = [loaded]
+    except json.JSONDecodeError:
+        # If not JSON, try comma separated
+        if "," in enabled_groups_config:
+             enabled_groups_config = [g.strip() for g in enabled_groups_config.split(",")]
+        else:
+             # Single value or empty
+             enabled_groups_config = [enabled_groups_config] if enabled_groups_config else []
+
 if enabled_groups_config:
-    ENABLED_GROUPS = set(int(g) for g in enabled_groups_config)
+    try:
+        # Ensure it's iterable
+        if not isinstance(enabled_groups_config, (list, tuple, set)):
+             enabled_groups_config = [enabled_groups_config]
+             
+        ENABLED_GROUPS = set(int(g) for g in enabled_groups_config)
+    except (ValueError, TypeError):
+        logger.error(f"Invalid format for ENABLED_GROUPS: {enabled_groups_config}")
 
 def is_group_enabled(group_id: int) -> bool:
     """Check if the feature is enabled for the given group."""
@@ -47,6 +70,16 @@ async def handle_update():
             await update_cmd.finish("未找到 git 命令，无法自动更新。")
             return
 
+        # Stash local changes to prevent overwrite errors
+        proc = await asyncio.create_subprocess_shell(
+            "git stash",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_stash, _ = await proc.communicate()
+        stash_output = stdout_stash.decode('utf-8', errors='replace')
+        was_stashed = "Saved working directory" in stash_output
+
         # Pull changes
         # Use subprocess to run git pull
         proc = await asyncio.create_subprocess_shell(
@@ -55,13 +88,35 @@ async def handle_update():
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
+        pull_returncode = proc.returncode
         
         output = stdout.decode('utf-8', errors='replace').strip()
+        pull_error = stderr.decode('utf-8', errors='replace').strip()
         
-        if proc.returncode != 0:
-            error_msg = stderr.decode('utf-8', errors='replace').strip()
+        # Restore local changes if they were stashed
+        pop_error = None
+        if was_stashed:
+            proc_pop = await asyncio.create_subprocess_shell(
+                "git stash pop",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout_pop, stderr_pop = await proc_pop.communicate()
+            if proc_pop.returncode != 0:
+                pop_output = stdout_pop.decode('utf-8', errors='replace').strip()
+                pop_err = stderr_pop.decode('utf-8', errors='replace').strip()
+                pop_error = f"{pop_output}\n{pop_err}".strip()
+
+        if pull_returncode != 0:
             # If git fails, it usually won't touch files, so .env and bots.json are safe.
-            await update_cmd.finish(f"更新失败:\n{error_msg}")
+            msg = f"更新失败:\n{pull_error}"
+            if pop_error:
+                msg += f"\n\n此外，恢复本地更改时也发生了错误:\n{pop_error}"
+            await update_cmd.finish(msg)
+            return
+            
+        if pop_error:
+            await update_cmd.finish(f"更新成功，但在恢复本地更改时发生冲突:\n{pop_error}\n请手动解决冲突。")
             return
             
         if "Already up to date" in output or "已经是最新" in output:
